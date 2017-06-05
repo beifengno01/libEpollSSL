@@ -18,7 +18,7 @@ void Reimu::EpollSSL::Server() {
 	FD_Listener = socket(AF_INET, SOCK_STREAM, 0);
 	setsockopt(FD_Listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
 
-	if (bind(FD_Listener, BindAddr, sizeof(sockaddr_in)) == -1) {
+	if (bind(FD_Listener, (sockaddr *)BindAddr.data(), BindAddr.size()) == -1) {
 		fprintf(stderr, "[EpollSSL %p] bind() error: %s\n", this, strerror(errno));
 		throw -1;
 	}
@@ -44,11 +44,10 @@ void Reimu::EpollSSL::Server() {
 
 		fcntl(FD_Client, F_SETFL, O_NONBLOCK|fcntl(FD_Client, F_GETFL, 0));
 
-		ConCtxBuf = (ConnectionContext *)calloc(1, sizeof(ConnectionContext));
+		ConCtxBuf = new ConnectionContext;
 		ConCtxBuf->FD = FD_Client;
-		ConCtxBuf->WriteBuffer = new std::vector<uint8_t>;
 
-		EventBuffer.events = EPOLLIN|EPOLLHUP;
+		EventBuffer.events = EPOLLIN|EPOLLHUP|EPOLLET;
 		EventBuffer.data.ptr = ConCtxBuf;
 
 		if (epoll_ctl(ThreadContexts[ConnCount % Threads].FD_Epoll, EPOLL_CTL_ADD, FD_Client, &EventBuffer) < 0) {

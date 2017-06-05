@@ -3,16 +3,17 @@
 //
 
 #include "EpollSSL.hpp"
-
-Reimu::EpollSSL::IOWrapper::IOWrapper(struct epoll_event *ev_cur, Reimu::EpollSSL::EpollThreadContext *parent_ctx) {
-	Event = ev_cur;
-	ThreadContext = parent_ctx;
-	ConnectionContext = (struct ConnectionContext *)ev_cur->data.ptr;
-
-	ReadBuffer = ThreadContext->ReadBuffer;
-	ReadSize = ThreadContext->ReadSize;
-
-	if (ConnectionContext->SSLState == 100) {
-		SSLSessionActive = 1;
-	}
-}
+//
+//Reimu::EpollSSL::IOWrapper::IOWrapper(struct epoll_event *ev_cur, Reimu::EpollSSL::EpollThreadContext *parent_ctx) {
+//	Event = ev_cur;
+//	ThreadContext = parent_ctx;
+//	ConnectionContext = (struct ConnectionContext *)ev_cur->data.ptr;
+//
+//	ReadBuffer = ThreadContext->ReadBuffer;
+//	if (ThreadContext->ReadSize > 0)
+//		ReadSize = (size_t)ThreadContext->ReadSize;
+//
+//	if (ConnectionContext->State & STATE_SSL_HANDSHAKE_FINISHED) {
+//		SSLSessionActive = 1;
+//	}
+//}

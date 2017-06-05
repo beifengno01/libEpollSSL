@@ -12,8 +12,104 @@ static inline void free_conn(struct Reimu::EpollSSL::ConnectionContext *con) {
 	}
 
 	close(con->FD);
-	delete con->WriteBuffer;
-	free(con);
+	delete con;
+}
+
+static inline void reimu_ssl_read(struct Reimu::EpollSSL::ConnectionContext *con) {
+
+	con->ReadSize = SSL_read(con->SSLContext, con->ReadBuffer, sizeof(con->ReadBuffer)-64);
+
+	fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] SSL_read(): %zd/%zu\n", con->ThreadContext->Parent,
+		con->ThreadContext, con->SSLContext, con->ReadSize, sizeof(con->ReadBuffer));
+
+	con->SSLError_Read = SSL_get_error(con->SSLContext, (int)con->ReadSize);
+
+	fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] SSL error read: %d\n", con->ThreadContext->Parent,
+		con->ThreadContext, con->SSLContext, con->SSLError_Read);
+
+	switch (con->SSLError_Read) {
+		case SSL_ERROR_NONE:
+			con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_READ;
+			con->EnableCallback = 1;
+			break;
+		case SSL_ERROR_WANT_READ:
+			con->SetReadOnly();
+			con->State |= Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_READ;
+			break;
+		case SSL_ERROR_WANT_WRITE:
+			con->SetWriteOnly();
+			con->State |= Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_READ;
+			break;
+		case SSL_ERROR_ZERO_RETURN:
+			con->ConnectionTerminated = 1;
+			con->EnableCallback = 1;
+			con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_READ;
+			break;
+		default:
+			con->ConnectionTerminated = 1;
+			con->EnableCallback = 1;
+			con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_READ;
+			break;
+	}
+
+}
+
+static inline void reimu_ssl_write(struct Reimu::EpollSSL::ConnectionContext *con) {
+
+	if (con->WriteBuffer.size()) {
+		uint8_t *write_pos = con->WriteBuffer.data() + con->WritePos;
+		int write_size = (int)(con->WriteBuffer.size() - con->WritePos);
+
+		int rc_ssl_write = SSL_write(con->SSLContext, write_pos, write_size);
+
+		fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] SSL_write(): %zd/%zu/%zu\n", con->ThreadContext->Parent,
+			con->ThreadContext, con->SSLContext, rc_ssl_write, con->WritePos, con->WriteBuffer.size());
+
+		con->SSLError_Write = SSL_get_error(con->SSLContext, rc_ssl_write);
+
+		fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] SSL error write: %d\n", con->ThreadContext->Parent,
+			con->ThreadContext, con->SSLContext, con->SSLError_Write);
+
+		switch (con->SSLError_Write) {
+			case SSL_ERROR_NONE:
+				if (rc_ssl_write > 0)
+					con->WritePos += rc_ssl_write;
+
+				if (con->WritePos == con->WriteBuffer.size()) {
+					con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_WRITE;
+					con->SetReadOnly();
+					con->EnableCallback = 1;
+					con->WritePos = 0;
+					con->WriteBuffer.resize(0);
+				}
+
+				BIO_flush(con->SSLContext->wbio);
+
+				break;
+			case SSL_ERROR_WANT_READ:
+				con->SetReadOnly();
+				con->State |= Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_WRITE;
+				break;
+			case SSL_ERROR_WANT_WRITE:
+				con->SetWriteOnly();
+				con->State |= Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_WRITE;
+				break;
+			case SSL_ERROR_ZERO_RETURN:
+				con->ConnectionTerminated = 1;
+				con->EnableCallback = 1;
+				con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_WRITE;
+				break;
+			default:
+				con->ConnectionTerminated = 1;
+				con->EnableCallback = 1;
+				con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_WRITE;
+				break;
+		}
+
+	} else {
+		con->State &= ~Reimu::EpollSSL::ConnectionStates::STATE_SSL_IO_QUEUED_WRITE;
+	}
+
 }
 
 void *Reimu::EpollSSL::EpollThread(struct EpollThreadContext *ctx) {
@@ -82,16 +178,35 @@ void *Reimu::EpollSSL::EpollThread(struct EpollThreadContext *ctx) {
 		}
 
 		for (int j = 0; j < rc_epwait; j++) { // Process events
-			fprintf(stderr, "[EpollSSL %p] [Thread %p] Processing event %d/%d\n", ctx->Parent, ctx, j+1, rc_epwait);
+
 
 			struct epoll_event *CurrentEvent = &ctx->EventsPending[j];
-			struct ConnectionContext *CurrentConCtx = (struct ConnectionContext *) ctx->EventsPending[j].data.ptr;
+			ConnectionContext *CurrentConCtx = (ConnectionContext *) ctx->EventsPending[j].data.ptr;
+			CurrentConCtx->Event = CurrentEvent;
+			CurrentConCtx->ThreadContext = ctx;
+
+			std::string epstrs;
+			if (CurrentEvent->events & EPOLLET)
+				epstrs += "EPOLLET|";
+
+			if (CurrentEvent->events & EPOLLIN)
+				epstrs += "EPOLLIN|";
+
+			if (CurrentEvent->events & EPOLLOUT)
+				epstrs += "EPOLLOUT|";
+
+			if (CurrentEvent->events & EPOLLHUP)
+				epstrs += "EPOLLHUP|";
+
+			epstrs.pop_back();
+
+			fprintf(stderr, "[EpollSSL %p] [Thread %p] Processing event %d/%d [%s]\n", ctx->Parent, ctx, j + 1,
+				rc_epwait, epstrs.c_str());
 
 			if (CurrentEvent->events & EPOLLHUP) { // Check for connection error
-				IOWrapper IOCtx(CurrentEvent, ctx);
-				IOCtx.ConnectionTerminated = 1;
+				CurrentConCtx->ConnectionTerminated = 1;
 
-				int rc_cb = ctx->Parent->Callback(&IOCtx, ctx->Parent->CallbackUserPtr);
+				int rc_cb = ctx->Parent->Callback(CurrentConCtx, ctx->Parent->CallbackUserPtr);
 
 				if (rc_cb == 0) {
 					if (epoll_ctl(ctx->FD_Epoll, EPOLL_CTL_DEL, CurrentConCtx->FD, CurrentEvent) <
@@ -102,9 +217,12 @@ void *Reimu::EpollSSL::EpollThread(struct EpollThreadContext *ctx) {
 				}
 			} else { // Normal I/O operation
 
-				if (CurrentConCtx->SSLState != 100) { // Attempt SSL handshake
-					if (CurrentConCtx->SSLState == 0) {
+				if (!(CurrentConCtx->State & STATE_SSL_HANDSHAKE_FINISHED)) { // Attempt SSL handshake
+					if (!(CurrentConCtx->State & STATE_SSL_HANDSHAKE_STARTED)) {
 						CurrentConCtx->SSLContext = SSL_new(ctx->SSLContext);
+
+						SSL_CTX_set_mode(ctx->SSLContext, SSL_MODE_ENABLE_PARTIAL_WRITE |
+										  SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
 						if (!SSL_set_fd(CurrentConCtx->SSLContext, CurrentConCtx->FD)) {
 							fprintf(stderr,
@@ -120,10 +238,10 @@ void *Reimu::EpollSSL::EpollThread(struct EpollThreadContext *ctx) {
 						fprintf(stderr, "[EpollSSL %p] [Thread %p] SSL conn accepted\n",
 							ctx->Parent, ctx);
 
-						CurrentConCtx->SSLState = 1;
+						CurrentConCtx->State |= STATE_SSL_HANDSHAKE_STARTED;
 					}
 
-					if (CurrentConCtx->SSLState == 1) {
+					if (CurrentConCtx->State & STATE_SSL_HANDSHAKE_STARTED) {
 						fprintf(stderr, "[EpollSSL %p] [Thread %p] Attempting handshake\n",
 							ctx->Parent, ctx);
 						int rc_hs = SSL_do_handshake(CurrentConCtx->SSLContext);
@@ -132,14 +250,12 @@ void *Reimu::EpollSSL::EpollThread(struct EpollThreadContext *ctx) {
 							int err_hs = SSL_get_error(CurrentConCtx->SSLContext, rc_hs);
 
 							if (err_hs == SSL_ERROR_WANT_WRITE) {
-								CurrentEvent->events |= EPOLLOUT;
-								CurrentEvent->events &= ~EPOLLIN;
+								CurrentConCtx->SetWriteOnly();
 								fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] "
 										"Handshaking: set fd write\n", ctx->Parent, ctx,
 									CurrentConCtx->SSLContext);
 							} else if (err_hs == SSL_ERROR_WANT_READ) {
-								CurrentEvent->events |= EPOLLIN;
-								CurrentEvent->events &= ~EPOLLOUT;
+								CurrentConCtx->SetReadOnly();
 								fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] "
 										"Handshaking: set fd read\n", ctx->Parent, ctx,
 									CurrentConCtx->SSLContext);
@@ -151,89 +267,43 @@ void *Reimu::EpollSSL::EpollThread(struct EpollThreadContext *ctx) {
 								free_conn(CurrentConCtx);
 							}
 						} else {
-							CurrentConCtx->SSLState = 100;
+							CurrentConCtx->State |= STATE_SSL_HANDSHAKE_FINISHED;
 							fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] "
 									"Handshake done\n", ctx->Parent, ctx,
 								CurrentConCtx->SSLContext);
 
-							CurrentEvent->events |= EPOLLIN;
-							CurrentEvent->events &= ~EPOLLOUT;
+							CurrentConCtx->SetReadOnly();
 						}
-						continue;
 					}
+					continue;
 				} else { // SSL handshake already done
 
-					bool ConnectionTerminated = 0;
-
-					if (CurrentEvent->events & EPOLLIN) {
-						ctx->ReadSize = SSL_read(CurrentConCtx->SSLContext, ctx->ReadBuffer,
-									 sizeof(ctx->ReadBuffer));
-
-						fprintf(stderr, "[EpollSSL %p] [Thread %p] [SSLCtx %p] SSL_read(): %zd"
-								"\n", ctx->Parent, ctx, CurrentConCtx->SSLContext,
-							ctx->ReadSize);
-
-						if (ctx->ReadSize <= 0) {
-							CurrentConCtx->SSLError_Read = SSL_get_error(
-								CurrentConCtx->SSLContext,
-								(int) ctx->ReadSize);
-
-							if ((ctx->ReadSize < 0 &&
-							     CurrentConCtx->SSLError_Read != SSL_ERROR_WANT_READ)
-							    || (ctx->ReadSize == 0)) {
-								ConnectionTerminated = 1;
-							}
-						} else {
-							CurrentConCtx->SSLError_Read = 0;
-						}
+					if (CurrentConCtx->State & STATE_SSL_IO_QUEUED_WRITE) { // Last write unfinished
+						reimu_ssl_write(CurrentConCtx);
+					} else  { // Read anyway
+						reimu_ssl_read(CurrentConCtx);
 					}
 
-					if (CurrentEvent->events & EPOLLOUT) {
-						if (CurrentConCtx->WriteBuffer->size()) {
-							void *write_start_pos = CurrentConCtx->WriteBuffer->data() +
-										CurrentConCtx->WritePos;
-							size_t write_size = CurrentConCtx->WriteBuffer->size() -
-									    CurrentConCtx->WritePos;
-							ssize_t sent = SSL_write(CurrentConCtx->SSLContext,
-										 write_start_pos, (int)write_size);
-
-							if (sent <= 0) {
-								CurrentConCtx->SSLError_Write = SSL_get_error(
-									CurrentConCtx->SSLContext,
-									(int)sent);
-
-								if ((sent < 0 &&
-								     CurrentConCtx->SSLError_Write != SSL_ERROR_WANT_WRITE)
-								    || (sent == 0)) {
-									ConnectionTerminated = 1;
-								}
-							} else {
-								CurrentConCtx->SSLError_Write = 0;
-
-								if (sent == write_size) {
-									CurrentConCtx->WriteBuffer->clear();
-									CurrentConCtx->WritePos = 0;
-								} else {
-									CurrentConCtx->WritePos += sent;
-								}
-							}
+					if (CurrentConCtx->EnableCallback) {
+						int rc_cb = 0;
+						rc_cb = ctx->Parent->Callback(CurrentConCtx,
+									      ctx->Parent->CallbackUserPtr);
+						if (rc_cb == 2) {
+							free_conn(CurrentConCtx);
 						}
+
+						CurrentConCtx->EnableCallback = 0;
+						CurrentConCtx->ReadSize = 0;
 					}
 
-					IOWrapper IOCtx(CurrentEvent, ctx);
-					IOCtx.ConnectionTerminated = ConnectionTerminated;
-
-					int rc_cb = ctx->Parent->Callback(&IOCtx, ctx->Parent->CallbackUserPtr);
-
-					if (rc_cb == 2 || ConnectionTerminated) {
+					if (CurrentConCtx->ConnectionTerminated)
 						free_conn(CurrentConCtx);
-					}
+
 				}
 
 			}
 
 		}
-
 	}
 
 	ending:

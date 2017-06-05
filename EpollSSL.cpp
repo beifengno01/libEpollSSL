@@ -7,7 +7,6 @@ void Reimu::EpollSSL::GlobalInit() {
 }
 
 Reimu::EpollSSL::EpollSSL() {
-	BindAddr = (struct sockaddr *)calloc(1, sizeof(struct sockaddr_in6));
 
 
 }
